@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:objectstore="http://www.mulesoft.org/schema/mule/objectstore"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata" xmlns:slack="http://www.mulesoft.org/schema/mule/slack" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/objectstore http://www.mulesoft.org/schema/mule/objectstore/current/mule-objectstore.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/slack http://www.mulesoft.org/schema/mule/slack/current/mule-slack.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+    <http:request-config name="HTTP_Request_Configuration" protocol="HTTPS" host="api.api.ai" basePath="/v1" port="443" doc:name="HTTP Request Configuration"/>
+    <slack:token-config name="Slack__Token_Configuration" accessToken="${slack.bot.token}" doc:name="Slack: Token Configuration"/>
+    <objectstore:config name="ObjectStore__Connector_config" entryTtl="600000" expirationInterval="10000" maxEntries="10000" persistent="true" doc:name="ObjectStore: Connector" partition="apiAiSessionId"/>
+    
+    <flow name="slackbotFlow_main">
+        <slack:retrieve-events config-ref="Slack__Token_Configuration" messages="true" onlyNewMessages="true" ignoreSelfEvents="true" doc:name="Slack (Streaming)" metadata:id="3c8aeeb8-271c-41af-8c60-d38f3287d8e5"/>
+        <dw:transform-message doc:name="Capture incoming slack message">
+            <dw:set-variable variableName="incomingMessage"><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	channel: payload.channel,
+	user: payload.user,
+	message: payload.text
+}]]></dw:set-variable>
+        </dw:transform-message>
+        <objectstore:contains config-ref="ObjectStore__Connector_config" key="#[flowVars.incomingMessage.user]" doc:name="Check if user has a session"/>
+        <choice doc:name="Choice">
+            <when expression="#[payload == true]">
+                <logger message="EXISTING SESSION" level="INFO" category="SESSION_INFO" doc:name="Existing Session Log"/>
+                <objectstore:retrieve config-ref="ObjectStore__Connector_config" key="#[flowVars.incomingMessage.user]" doc:name="Retrieve the existing sesssionId"/>
+                <set-variable variableName="sessionId" value="#[payload.toString()]" doc:name="Set SessionID"/>
+            </when>
+            <otherwise>
+                <logger message="CREATE NEW SESSION" level="INFO" category="SESSION_INFO" doc:name="Create Session Log"/>
+                <dw:transform-message doc:name="Create SessionID">
+                    <dw:set-variable variableName="sessionId"><![CDATA[%dw 1.0
+%output application/java
+---
+((1+random) * 100000) as :string {format: "#"}]]></dw:set-variable>
+                </dw:transform-message>
+                <objectstore:store config-ref="ObjectStore__Connector_config" key="#[flowVars.incomingMessage.user]" value-ref="#[flowVars.sessionId]" overwrite="true" doc:name="Create a session for the user"/>
+            </otherwise>
+        </choice>
+        <dw:transform-message doc:name="Create APIAI Message">
+            <dw:input-payload doc:sample="sample_data/json_1.json"/>
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+{
+    query: flowVars.incomingMessage.message,
+    sessionId: flowVars.sessionId,
+    lang: "en"
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <logger message="Requet:::::::#[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger"/>
+        <http:request config-ref="HTTP_Request_Configuration" path="/query" method="POST" doc:name="Send API.AI raw message for interpretation">
+            <http:request-builder>
+                <http:query-param paramName="v" value="20160101"/>
+                <http:header headerName="Authorization" value="${api.ai.clientToken}"/>
+                <http:header headerName="Content-Type" value="application/json"/>
+            </http:request-builder>
+        </http:request>
+        <logger message="Response::::: #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger"/>
+        <dw:transform-message doc:name="Capture interpreted parameters" metadata:id="23d9ed82-8ef6-4769-afae-96decca3e139">
+            <dw:input-payload mimeType="application/json" doc:sample="/Users/fernandomelone/Downloads/apiAiProductResponse.json"/>
+            <dw:set-variable variableName="apiAiResponse"><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	intent: payload.result.metadata.intentName,
+	speech: payload.result.fulfillment.speech,
+	incomplete: payload.result.actionIncomplete
+}]]></dw:set-variable>
+        </dw:transform-message>
+        <choice doc:name="Choice">
+            <when expression="#[flowVars.apiAiResponse.intent == &quot;order.pizza&quot; &amp;&amp; flowVars.apiAiResponse.incomplete == false]">
+                <logger message="ORDER COMPLETE, FULFILL ORDER" level="INFO" doc:name="Fulfill Order"/>
+                <flow-ref name="slackbotFlow_fulfill_purchase" doc:name="slackbotFlow_fulfill_purchase"/>
+            </when>
+            <otherwise>
+                <logger message="NO PATH TAKEN, KEEP CONVERSATION" level="INFO" doc:name="No path taken, keep conversation"/>
+            </otherwise>
+        </choice>
+        <slack:post-message config-ref="Slack__Token_Configuration" channelId="#[flowVars.incomingMessage.channel]" iconURL="http://icons.iconarchive.com/icons/sonya/swarm/256/Pizza-icon.png" username="PizzaStore" message="#[flowVars.apiAiResponse.speech]" doc:name="Reply to original sender"/>
+    </flow>
+    <flow name="slackbotFlow_fulfill_purchase" processingStrategy="synchronous">
+        <objectstore:remove config-ref="ObjectStore__Connector_config" key="#[flowVars.incomingMessage.user]" ignoreNotExists="true" doc:name="Finalize (remove) Session"/>
+        <logger message="PURCHASE FULFILLED" level="INFO" doc:name="Fulfill the purchase"/>
+    </flow>
+</mule>
